@@ -1162,8 +1162,14 @@ public class StripeTerminal
     notifyListeners("didFailReaderReconnect", null);
   }
 
-  @Override
   public void onStop() {
     cancelDiscoverReaders();
   }
+
+  @Override
+  public void onRequestPermissionsResult(
+    int requestCode,
+    @NonNull String[] permissions,
+    @NonNull int[] grantResults
+  ) {}
 }

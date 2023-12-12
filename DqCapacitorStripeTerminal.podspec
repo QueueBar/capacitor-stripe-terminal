@@ -1,7 +1,7 @@
 
   Pod::Spec.new do |s|
     s.name = 'DqCapacitorStripeTerminal'
-    s.version = '0.0.1'
+    s.version = '0.0.3'
     s.summary = 'Capacitor plugin for Stripe Terminal (credit card readers).'
     s.license = 'MIT'
     s.homepage = 'https://github.com/QueueBar/capacitor-stripe-terminal'
