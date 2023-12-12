@@ -7,14 +7,17 @@ import StripeTerminal
  * here: https://capacitor.ionicframework.com/docs/plugins/ios
  */
 @objc(StripeTerminal)
-public class StripeTerminal: CAPPlugin, ConnectionTokenProvider, DiscoveryDelegate, TerminalDelegate, BluetoothReaderDelegate {
+public class StripeTerminal: CAPPlugin, ConnectionTokenProvider, DiscoveryDelegate, TerminalDelegate, BluetoothReaderDelegate, ReconnectionDelegate, LocalMobileReaderDelegate {
     private var pendingConnectionTokenCompletionBlock: ConnectionTokenCompletionBlock?
     private var pendingDiscoverReaders: Cancelable?
     private var pendingInstallUpdate: Cancelable?
     private var pendingCollectPaymentMethod: Cancelable?
+    private var pendingReaderAutoReconnect: Cancelable?
     private var currentUpdate: ReaderSoftwareUpdate?
     private var currentPaymentIntent: PaymentIntent?
+    private var cancelDiscoverReadersCall: CAPPluginCall?
     private var isInitialized: Bool = false
+    private var thread = DispatchQueue.init(label: "CapacitorStripeTerminal")
 
     private var readers: [Reader]?
 
@@ -89,38 +92,50 @@ public class StripeTerminal: CAPPlugin, ConnectionTokenProvider, DiscoveryDelega
         let method = UInt(call.getInt("discoveryMethod") ?? 0)
         let locationId = call.getString("locationId") ?? nil
 
-        let discoveryMethod = DiscoveryMethod(rawValue: method) ?? DiscoveryMethod.bluetoothProximity
+        let discoveryMethod = StripeTerminalUtils.translateDiscoveryMethod(method: method)
 
-        pendingDiscoverReaders = nil
-
-        let config = DiscoveryConfiguration(discoveryMethod: discoveryMethod,
-                                            locationId: locationId,
-                                            simulated: simulated)
-        pendingDiscoverReaders = Terminal.shared.discoverReaders(config, delegate: self, completion: { error in
-            self.pendingDiscoverReaders = nil
-
+        let config = DiscoveryConfiguration(
+            discoveryMethod: discoveryMethod,
+            locationId: locationId,
+            simulated: simulated
+        )
+        
+        guard pendingDiscoverReaders == nil else {
+            call.reject("discoverReaders is busy")
+            return
+        }
+                
+        self.pendingDiscoverReaders = Terminal.shared.discoverReaders(config, delegate: self) { error in
             if let error = error {
                 call.reject(error.localizedDescription, nil, error)
+                self.pendingDiscoverReaders = nil
             } else {
                 call.resolve()
+                self.pendingDiscoverReaders = nil
+
+                // if cancelDiscoverReadersCall exists, resolve it since the discovery is complete now
+                self.cancelDiscoverReadersCall?.resolve()
+                self.cancelDiscoverReadersCall = nil
             }
-        })
+        }
     }
 
     @objc func cancelDiscoverReaders(_ call: CAPPluginCall? = nil) {
-        if let cancelable = pendingDiscoverReaders {
-            cancelable.cancel { error in
-                if let error = error {
-                    call?.reject(error.localizedDescription, nil, error)
-                } else {
-                    call?.resolve()
-                }
-            }
-
+        guard let cancelable = pendingDiscoverReaders else {
+            call?.resolve()
             return
         }
-
-        call?.resolve()
+        
+        cancelable.cancel() { error in
+            if let error = error as NSError? {
+                call?.reject(error.localizedDescription, nil, error)
+                self.pendingDiscoverReaders = nil
+            } else {
+                // do not call resolve, let discoverReaders call it when it is actually complete
+                self.cancelDiscoverReadersCall = call
+            }
+        }
+        
     }
 
     @objc func connectBluetoothReader(_ call: CAPPluginCall) {
@@ -139,7 +154,13 @@ public class StripeTerminal: CAPPlugin, ConnectionTokenProvider, DiscoveryDelega
             return
         }
 
-        let connectionConfig = BluetoothConnectionConfiguration(locationId: locationId)
+        let autoReconnectOnUnexpectedDisconnect = call.getBool("autoReconnectOnUnexpectedDisconnect", false)
+
+        let connectionConfig = BluetoothConnectionConfiguration(
+            locationId: locationId,
+            autoReconnectOnUnexpectedDisconnect: autoReconnectOnUnexpectedDisconnect,
+            autoReconnectionDelegate: self
+        )
 
         // this must be run on the main thread
         // https://stackoverflow.com/questions/44767778/main-thread-checker-ui-api-called-on-a-background-thread-uiapplication-appli
@@ -188,12 +209,55 @@ public class StripeTerminal: CAPPlugin, ConnectionTokenProvider, DiscoveryDelega
         }
     }
 
+    @objc func connectLocalMobileReader(_ call: CAPPluginCall) {
+        guard let serialNumber = call.getString("serialNumber") else {
+            call.reject("Must provide a serial number")
+            return
+        }
+
+        guard let locationId = call.getString("locationId") else {
+            call.reject("Must provide a location ID")
+            return
+        }
+
+        guard let reader = readers?.first(where: { $0.serialNumber == serialNumber }) else {
+            call.reject("No reader found")
+            return
+        }
+        
+        let onBehalfOf = call.getString("onBehalfOf")
+        let merchantDisplayName = call.getString("merchantDisplayName")
+        let tosAcceptancePermitted = call.getBool("tosAcceptancePermitted", false)
+
+        let connectionConfig = LocalMobileConnectionConfiguration(
+            locationId: locationId,
+            merchantDisplayName: merchantDisplayName,
+            onBehalfOf: onBehalfOf,
+            tosAcceptancePermitted: tosAcceptancePermitted
+        )
+
+        // this must be run on the main thread
+        // https://stackoverflow.com/questions/44767778/main-thread-checker-ui-api-called-on-a-background-thread-uiapplication-appli
+        DispatchQueue.main.async {
+            Terminal.shared.connectLocalMobileReader(reader, delegate: self, connectionConfig: connectionConfig, completion: { reader, error in
+                if let reader = reader {
+                    call.resolve([
+                        "reader": StripeTerminalUtils.serializeReader(reader: reader),
+                    ])
+                } else if let error = error {
+                    call.reject(error.localizedDescription, nil, error)
+                }
+            })
+        }
+    }
+
     @objc func disconnectReader(_ call: CAPPluginCall) {
         if Terminal.shared.connectedReader == nil {
             call.resolve()
             return
         }
 
+        let semaphore = DispatchSemaphore(value: 0)
         DispatchQueue.main.async {
             Terminal.shared.disconnectReader { error in
                 if let error = error {
@@ -201,8 +265,10 @@ public class StripeTerminal: CAPPlugin, ConnectionTokenProvider, DiscoveryDelega
                 } else {
                     call.resolve()
                 }
+                semaphore.signal()
             }
         }
+        _ = semaphore.wait(timeout: .now() + 10)
     }
 
     @objc func installAvailableUpdate(_ call: CAPPluginCall) {
@@ -242,7 +308,7 @@ public class StripeTerminal: CAPPlugin, ConnectionTokenProvider, DiscoveryDelega
             let reader = StripeTerminalUtils.serializeReader(reader: reader)
             call.resolve(["reader": reader])
         } else {
-            call.resolve()
+            call.resolve(["reader": nil])
         }
     }
 
@@ -252,15 +318,20 @@ public class StripeTerminal: CAPPlugin, ConnectionTokenProvider, DiscoveryDelega
             return
         }
 
-        Terminal.shared.retrievePaymentIntent(clientSecret: clientSecret) { retrieveResult, retrieveError in
-            self.currentPaymentIntent = retrieveResult
+        let semaphore = DispatchSemaphore(value: 0)
+        thread.async {
+            Terminal.shared.retrievePaymentIntent(clientSecret: clientSecret) { retrieveResult, retrieveError in
+                self.currentPaymentIntent = retrieveResult
 
-            if let error = retrieveError {
-                call.reject(error.localizedDescription, nil, error)
-            } else if let paymentIntent = retrieveResult {
-                call.resolve(["intent": StripeTerminalUtils.serializePaymentIntent(intent: paymentIntent)])
+                if let error = retrieveError {
+                    call.reject(error.localizedDescription, nil, error)
+                } else if let paymentIntent = retrieveResult {
+                    call.resolve(["intent": StripeTerminalUtils.serializePaymentIntent(intent: paymentIntent)])
+                }
+                semaphore.signal()
             }
         }
+        _ = semaphore.wait(timeout: .now() + 10)
     }
 
     @objc func cancelCollectPaymentMethod(_ call: CAPPluginCall? = nil) {
@@ -281,8 +352,12 @@ public class StripeTerminal: CAPPlugin, ConnectionTokenProvider, DiscoveryDelega
     }
 
     @objc func collectPaymentMethod(_ call: CAPPluginCall) {
+        let updatePaymentIntent = call.getBool("updatePaymentIntent", false)
+
+        let collectConfig = CollectConfiguration(updatePaymentIntent: updatePaymentIntent)
+
         if let intent = currentPaymentIntent {
-            pendingCollectPaymentMethod = Terminal.shared.collectPaymentMethod(intent) { collectResult, collectError in
+            pendingCollectPaymentMethod = Terminal.shared.collectPaymentMethod(intent, collectConfig: collectConfig) { collectResult, collectError in
                 self.pendingCollectPaymentMethod = nil
 
                 if let error = collectError {
@@ -298,23 +373,30 @@ public class StripeTerminal: CAPPlugin, ConnectionTokenProvider, DiscoveryDelega
     }
 
     @objc func processPayment(_ call: CAPPluginCall) {
-        if let intent = currentPaymentIntent {
-            Terminal.shared.processPayment(intent) { paymentIntent, error in
-                if let error = error {
-                    call.reject(error.localizedDescription, nil, error)
-                } else if let paymentIntent = paymentIntent {
-                    self.currentPaymentIntent = paymentIntent
-                    call.resolve(["intent": StripeTerminalUtils.serializePaymentIntent(intent: paymentIntent)])
+        thread.async {
+            if let intent = self.currentPaymentIntent {
+                Terminal.shared.processPayment(intent) { paymentIntent, error in
+                    if let error = error {
+                        call.reject(error.localizedDescription, nil, error, [
+                            "decline_code": error.declineCode as Any,
+                            "payment_intent": error.paymentIntent?.originalJSON as Any
+                        ])
+                    } else if let paymentIntent = paymentIntent {
+                        self.currentPaymentIntent = paymentIntent
+                        call.resolve(["intent": StripeTerminalUtils.serializePaymentIntent(intent: paymentIntent)])
+                    }
                 }
+            } else {
+                call.reject("There is no active payment intent. Make sure you called retrievePaymentIntent first")
             }
-        } else {
-            call.reject("There is no active payment intent. Make sure you called retrievePaymentIntent first")
         }
     }
 
     @objc func clearCachedCredentials(_ call: CAPPluginCall) {
-        Terminal.shared.clearCachedCredentials()
-        call.resolve()
+        thread.async {
+            Terminal.shared.clearCachedCredentials()
+            call.resolve()
+        }
     }
 
     @objc func setReaderDisplay(_ call: CAPPluginCall) {
@@ -336,23 +418,33 @@ public class StripeTerminal: CAPPlugin, ConnectionTokenProvider, DiscoveryDelega
 
         cart.lineItems = lineItemsArray
 
-        Terminal.shared.setReaderDisplay(cart) { error in
-            if let error = error {
-                call.reject(error.localizedDescription, nil, error)
-            } else {
-                call.resolve()
+        let semaphore = DispatchSemaphore(value: 0)
+        thread.async {
+            Terminal.shared.setReaderDisplay(cart) { error in
+                if let error = error {
+                    call.reject(error.localizedDescription, nil, error)
+                } else {
+                    call.resolve()
+                }
+                semaphore.signal()
             }
         }
+        _ = semaphore.wait(timeout: .now() + 10)
     }
 
     @objc func clearReaderDisplay(_ call: CAPPluginCall) {
-        Terminal.shared.clearReaderDisplay { error in
-            if let error = error {
-                call.reject(error.localizedDescription, nil, error)
-            } else {
-                call.resolve()
+        let semaphore = DispatchSemaphore(value: 0)
+        thread.async {
+            Terminal.shared.clearReaderDisplay { error in
+                if let error = error {
+                    call.reject(error.localizedDescription, nil, error)
+                } else {
+                    call.resolve()
+                }
+                semaphore.signal()
             }
         }
+        _ = semaphore.wait(timeout: .now() + 10)
     }
 
     @objc func listLocations(_ call: CAPPluginCall) {
@@ -367,21 +459,27 @@ public class StripeTerminal: CAPPlugin, ConnectionTokenProvider, DiscoveryDelega
                                              endingBefore: endingBefore,
                                              startingAfter: startingAfter)
         }
-        Terminal.shared.listLocations(parameters: params) { locations, hasMore, error in
-            if let error = error {
-                call.reject(error.localizedDescription, nil, error)
-            } else {
-                let locationsJSON = locations?.map {
-                    (location: Location) -> [String: Any] in
-                    StripeTerminalUtils.serializeLocation(location: location)
-                }
+        
+        let semaphore = DispatchSemaphore(value: 0)
+        thread.async {
+            Terminal.shared.listLocations(parameters: params) { locations, hasMore, error in
+                if let error = error {
+                    call.reject(error.localizedDescription, nil, error)
+                } else {
+                    let locationsJSON = locations?.map {
+                        (location: Location) -> [String: Any] in
+                        StripeTerminalUtils.serializeLocation(location: location)
+                    }
 
-                call.resolve([
-                    "hasMore": hasMore,
-                    "locations": locationsJSON as Any,
-                ])
+                    call.resolve([
+                        "hasMore": hasMore,
+                        "locations": locationsJSON as Any,
+                    ])
+                }
+                semaphore.signal()
             }
         }
+        _ = semaphore.wait(timeout: .now() + 10)
     }
 
     @objc func getSimulatorConfiguration(_ call: CAPPluginCall) {
@@ -409,6 +507,23 @@ public class StripeTerminal: CAPPlugin, ConnectionTokenProvider, DiscoveryDelega
         }
 
         return getSimulatorConfiguration(call)
+    }
+    
+    @objc func cancelAutoReconnect(_ call: CAPPluginCall) {
+        if let cancelable = pendingReaderAutoReconnect {
+            cancelable.cancel { error in
+                if let error = error {
+                    call.reject(error.localizedDescription, nil, error)
+                } else {
+                    self.pendingReaderAutoReconnect = nil
+                    call.resolve()
+                }
+            }
+
+            return
+        }
+
+        call.resolve()
     }
 
     // MARK: DiscoveryDelegate
@@ -471,5 +586,54 @@ public class StripeTerminal: CAPPlugin, ConnectionTokenProvider, DiscoveryDelega
 
     public func reader(_: Reader, didRequestReaderDisplayMessage displayMessage: ReaderDisplayMessage) {
         notifyListeners("didRequestReaderDisplayMessage", data: ["value": displayMessage.rawValue])
+    }
+        
+    // MARK: LocalMobileReaderDelegate
+
+    public func localMobileReader(_ reader: Reader, didStartInstallingUpdate update: ReaderSoftwareUpdate, cancelable: Cancelable?) {
+        pendingInstallUpdate = cancelable
+        currentUpdate = update
+        notifyListeners("didStartInstallingUpdate", data: ["update": StripeTerminalUtils.serializeUpdate(update: update)])
+    }
+
+    public func localMobileReader(_ reader: Reader, didReportReaderSoftwareUpdateProgress progress: Float) {
+        notifyListeners("didReportReaderSoftwareUpdateProgress", data: ["progress": progress])
+    }
+
+    public func localMobileReader(_ reader: Reader, didFinishInstallingUpdate update: ReaderSoftwareUpdate?, error: Error?) {
+        if let error = error {
+            notifyListeners("didFinishInstallingUpdate", data: ["error": error.localizedDescription as Any])
+        } else if let update = update {
+            notifyListeners("didFinishInstallingUpdate", data: ["update": StripeTerminalUtils.serializeUpdate(update: update)])
+            currentUpdate = nil
+        }
+    }
+    
+    public func localMobileReader(_: Reader, didRequestReaderInput inputOptions: ReaderInputOptions = []) {
+        notifyListeners("didRequestReaderInput", data: ["value": inputOptions.rawValue])
+    }
+
+    public func localMobileReader(_: Reader, didRequestReaderDisplayMessage displayMessage: ReaderDisplayMessage) {
+        notifyListeners("didRequestReaderDisplayMessage", data: ["value": displayMessage.rawValue])
+    }
+    
+    public func localMobileReaderDidAcceptTermsOfService(_: Reader) {
+        notifyListeners("localMobileReaderDidAcceptTermsOfService", data: nil)
+    }
+
+    // MARK: ReconnectionDelegate
+
+    public func terminal(_ terminal: Terminal, didStartReaderReconnect cancelable: Cancelable) {
+        pendingReaderAutoReconnect = cancelable
+        notifyListeners("didStartReaderReconnect", data: nil)
+    }
+
+    public func terminalDidSucceedReaderReconnect(_ terminal: Terminal) {
+        pendingReaderAutoReconnect = nil
+        notifyListeners("didSucceedReaderReconnect", data: nil)
+    }
+    public func terminalDidFailReaderReconnect(_ terminal: Terminal) {
+        pendingReaderAutoReconnect = nil
+        notifyListeners("didFailReaderReconnect", data: nil)
     }
 }

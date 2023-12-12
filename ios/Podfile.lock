@@ -1,13 +1,13 @@
 PODS:
-  - Capacitor (3.4.3):
+  - Capacitor (3.9.0):
     - CapacitorCordova
-  - CapacitorCordova (3.4.3)
-  - StripeTerminal (2.8.0)
+  - CapacitorCordova (3.9.0)
+  - StripeTerminal (2.17.1)
 
 DEPENDENCIES:
   - "Capacitor (from `../node_modules/@capacitor/ios`)"
   - "CapacitorCordova (from `../node_modules/@capacitor/ios`)"
-  - StripeTerminal (= 2.8.0)
+  - StripeTerminal (= 2.17.1)
 
 SPEC REPOS:
   trunk:
@@ -20,10 +20,10 @@ EXTERNAL SOURCES:
     :path: "../node_modules/@capacitor/ios"
 
 SPEC CHECKSUMS:
-  Capacitor: a8d7fa9fb3b50adc610247bb8d0310e83424f746
-  CapacitorCordova: 687b7d3ef4872c03aa2a2eb052d23008be9ad76b
-  StripeTerminal: 6a941bb9feec23d9933eaf330fc398cdce95e252
+  Capacitor: 706895818151b183fd1ef099465e47ad33e9239f
+  CapacitorCordova: 3c768ee86bbedd4b99b68551a78ed24128bacb40
+  StripeTerminal: 11f19c848985f980a708b4993ff59448637f5c82
 
-PODFILE CHECKSUM: 0642bdce9608c719a72e34cdb16f710918a165fb
+PODFILE CHECKSUM: ed38e335094fede804dcf8ddc7f4f9ee7225e400
 
-COCOAPODS: 1.10.2
+COCOAPODS: 1.11.3

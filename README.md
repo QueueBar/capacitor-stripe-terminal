@@ -1,3 +1,6 @@
+This is an upstream maintained version, this may contain breaking changes.
+
+
 <p align="center"><br><img src="https://user-images.githubusercontent.com/236501/85893648-1c92e880-b7a8-11ea-926d-95355b8175c7.png" width="128" height="128" /></p>
 <h3 align="center">Capacitor Stripe Terminal</h3>
 <p align="center"><strong><code>capacitor-stripe-terminal</code></strong></p>
@@ -176,7 +179,7 @@ See the full API docs [here](https://oss.eventone.page/capacitor-stripe-terminal
 
 <p>
     <a href="https://event1.io/?utm_medium=opensource&utm_source=capacitor-stripe-terminal">
-        <img src="https://e1-com.eventone.page/brand/wordmark/wm.svg" width="200px">
+        <img src="https://brand.event1.io/wordmark/wm.svg" width="200px">
     </a>
 </p>
 
